@@ -1,0 +1,120 @@
+name: Update news
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install libraries
+        run: pip install beautifulsoup4 pillow
+      - name: Read Telegram channel
+        run: |
+          python - <<'PY'
+          import datetime, io, json, os, re, sys, urllib.request
+          from bs4 import BeautifulSoup
+          from PIL import Image
+
+          CH = 'bukva_ti'
+          UA = {'User-Agent': 'Mozilla/5.0 (compatible; NewsBot/1.0)'}
+          MONTHS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля',
+                    'августа', 'сентября', 'октября', 'ноября', 'декабря']
+
+          def get(url):
+              return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30).read()
+
+          def split_title(text):
+              first, _, other = text.strip().partition('\n')
+              m = re.match(r'(.+?[.!?…]+)(?=\s|$)', first)
+              if m:
+                  title, rest = m.group(1), first[m.end():].strip()
+              else:
+                  title, rest = first, ''
+              title = title.strip().rstrip('.…').strip()
+              body = (rest + '\n' + other).strip() if rest else other.strip()
+              return title, body
+
+          def parse(html):
+              soup = BeautifulSoup(html, 'html.parser')
+              if not soup.select_one('.tgme_channel_history'):
+                  return None
+              posts = []
+              for w in soup.select('.tgme_widget_message'):
+                  ref = w.get('data-post', '')
+                  if '/' not in ref:
+                      continue
+                  pid = ref.split('/')[1]
+                  t = w.select_one('.tgme_widget_message_text')
+                  if not t:
+                      continue
+                  for br in t.find_all('br'):
+                      br.replace_with('\n')
+                  text = t.get_text().strip()
+                  if not text:
+                      continue
+                  title, body = split_title(text)
+                  img = None
+                  el = w.select_one('.tgme_widget_message_photo_wrap') or w.select_one('.tgme_widget_message_video_thumb')
+                  if el:
+                      m = re.search(r"url\(['\"]?([^'\")]+)", el.get('style', ''))
+                      if m:
+                          img = m.group(1)
+                  date = ''
+                  tm = w.select_one('.tgme_widget_message_date time')
+                  if tm and tm.get('datetime'):
+                      d = datetime.datetime.fromisoformat(tm['datetime'])
+                      date = f'{d.day} {MONTHS[d.month - 1]} {d.year}'
+                  posts.append({'id': int(pid), 'title': title, 'text': body,
+                                'image_url': img, 'date': date,
+                                'url': f'https://t.me/{CH}/{pid}'})
+              return posts
+
+          def main():
+              html = get(f'https://t.me/s/{CH}').decode('utf-8', 'replace')
+              posts = parse(html)
+              if posts is None:
+                  print('Channel page not recognized, nothing changed')
+                  return
+              posts = posts[::-1][:10]
+              os.makedirs('img', exist_ok=True)
+              keep = set()
+              for p in posts:
+                  u = p.pop('image_url')
+                  p['image'] = None
+                  if u:
+                      fn = f"img/{p['id']}.jpg"
+                      if not os.path.exists(fn):
+                          try:
+                              im = Image.open(io.BytesIO(get(u))).convert('RGB')
+                              im.thumbnail((1000, 1000))
+                              im.save(fn, 'JPEG', quality=78, optimize=True)
+                          except Exception as e:
+                              print('image failed:', e)
+                      if os.path.exists(fn):
+                          p['image'] = fn
+                          keep.add(fn)
+              for f in os.listdir('img'):
+                  if f'img/{f}' not in keep:
+                      os.remove(f'img/{f}')
+              with open('news.json', 'w', encoding='utf-8') as f:
+                  json.dump(posts, f, ensure_ascii=False, indent=1)
+              with open('updated.txt', 'w') as f:
+                  f.write(datetime.date.today().isoformat())
+              print('posts:', len(posts))
+
+          if __name__ == '__main__':
+              main()
+          PY
+      - name: Save changes
+        run: |
+          git config user.name "news-bot"
+          git config user.email "news-bot@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || (git commit -m "Update news" && git push)
